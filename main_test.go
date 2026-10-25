@@ -54,7 +54,10 @@ func TestSelectHosts(t *testing.T) {
 
 func TestRender(t *testing.T) {
 	got := render("10.0.0.1", []string{"a.x", "b.x"})
-	if want := header + "10.0.0.1 a.x\n10.0.0.1 b.x\n"; got != want {
+	want := header +
+		"host-record=a.x,10.0.0.1\nlocal=/a.x/\n" +
+		"host-record=b.x,10.0.0.1\nlocal=/b.x/\n"
+	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
 	if render("10.0.0.1", nil) != header {
@@ -164,9 +167,9 @@ func readFile(t *testing.T, p string) string {
 
 func testTargets(dir string) []target {
 	return []target{
-		{filepath.Join(dir, "lan", "traefik.hosts"), "192.168.1.33"},
-		{filepath.Join(dir, "zt", "traefik.hosts"), "10.144.25.2"},
-		{filepath.Join(dir, "ts", "traefik.hosts"), "100.101.188.115"},
+		{filepath.Join(dir, "lan", "traefik.conf"), "192.168.1.33"},
+		{filepath.Join(dir, "zt", "traefik.conf"), "10.144.25.2"},
+		{filepath.Join(dir, "ts", "traefik.conf"), "100.101.188.115"},
 	}
 }
 

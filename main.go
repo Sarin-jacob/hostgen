@@ -2,17 +2,26 @@
 //
 // It lists running containers over the Docker socket, extracts hostnames from
 // traefik.http.routers.<name>.rule labels (Host(...) matchers only), keeps the
-// ones under DOMAIN, and writes one hosts file per target, each with that
-// target's own IP. dnsmasq reads the files through hostsdir.
+// ones under DOMAIN, and writes one dnsmasq conf file per target, each with
+// that target's own IP. Every name gets two lines:
 //
-// dnsmasq must have no wildcard address= rule for the domain. Names that are
-// not listed are forwarded to the upstream resolver (Cloudflare), so anything
-// Traefik does not serve resolves publicly. HostRegexp routers, such as a
+//	host-record=lfs.jell0.online,100.101.188.115
+//	local=/lfs.jell0.online/
+//
+// host-record answers A (and the matching PTR) locally. local= stops dnsmasq
+// from forwarding any other query for that name, so HTTPS (type 65) records
+// published by Cloudflare, with their ECH keys, never reach local clients.
+// Without that, Firefox based browsers send an ECH ClientHello to Traefik and
+// fail with a certificate error. Names Traefik does not serve are untouched
+// and resolve through the upstream as usual, ECH included.
+//
+// dnsmasq must have no wildcard address= rule for the domain and must read
+// the files with conf-dir=<dir>,*.conf. HostRegexp routers, such as a
 // catch-all error page router, are ignored on purpose.
 //
-// If Docker cannot be read, the existing files are left untouched. When the
-// files change, the RESTART containers are restarted, because dnsmasq never
-// drops old hostsdir records on its own (only on SIGHUP or restart).
+// If Docker cannot be read, the existing files are left untouched. When a
+// file changes, the RESTART containers are restarted, since dnsmasq only
+// reads its config at startup.
 //
 // Environment:
 //
@@ -20,11 +29,11 @@
 //	              (default jell0.online)
 //	TARGETS       required, comma separated path=ip pairs, one per dnsmasq
 //	              instance, for example
-//	              /out/ts/traefik.hosts=100.101.188.115,/out/lan/traefik.hosts=192.168.1.33
+//	              /out/ts/traefik.conf=100.101.188.115,/out/lan/traefik.conf=192.168.1.33
 //	EXCLUDE       comma separated names never published, so they keep going
 //	              to the upstream even if a Traefik label exists
 //	RESTART       comma separated dnsmasq container names to restart when a
-//	              file changes. Needed so removed names disappear.
+//	              file changes. Needed, dnsmasq does not reload conf files.
 //	EXPOSED_BY_DEFAULT  set to true to match Traefik exposedByDefault=true
 //	              (default false: only traefik.enable=true containers count)
 //	INTERVAL      Docker check interval (default 5s)
@@ -254,16 +263,18 @@ func selectHosts(raw map[string]bool, domain string, exclude map[string]bool) []
 	return out
 }
 
+// render returns the conf file content for one dnsmasq instance.
 func render(ip string, hosts []string) string {
 	var b strings.Builder
 	b.WriteString(header)
 	for _, h := range hosts {
-		fmt.Fprintf(&b, "%s %s\n", ip, h)
+		fmt.Fprintf(&b, "host-record=%s,%s\nlocal=/%s/\n", h, ip, h)
 	}
 	return b.String()
 }
 
-// writeIfChanged replaces the file atomically, and only when the content differs.
+// writeIfChanged replaces the file atomically, and only when the content
+// differs. The temp file starts with a dot, which dnsmasq conf-dir skips.
 func writeIfChanged(path, content string) (bool, error) {
 	if old, err := os.ReadFile(path); err == nil && string(old) == content {
 		return false, nil
@@ -272,7 +283,6 @@ func writeIfChanged(path, content string) (bool, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, err
 	}
-	// dotfile name: dnsmasq skips hidden files in hostsdir
 	tmp := filepath.Join(dir, "."+filepath.Base(path)+".tmp")
 	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
 		return false, err
@@ -323,7 +333,7 @@ func (a *app) tick(ctx context.Context) error {
 		if found {
 			log.Printf("restarted %s", n)
 		} else {
-			log.Printf("container %s not found, skipped (it reads the files when it starts)", n)
+			log.Printf("container %s not found, skipped (it reads the config when it starts)", n)
 		}
 	}
 	return nil
@@ -367,7 +377,7 @@ func main() {
 	log.Printf("domain=%s interval=%s targets=%d restart=%v exposedByDefault=%t",
 		cfg.domain, cfg.interval, len(cfg.targets), cfg.restart, cfg.exposedAll)
 	if len(cfg.restart) == 0 {
-		log.Print("warning: RESTART is empty, removed names stay in dnsmasq until it restarts")
+		log.Print("warning: RESTART is empty, dnsmasq will not see changes until it restarts")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
