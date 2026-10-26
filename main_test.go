@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +105,26 @@ type fakeDocker struct {
 	containers []map[string]any
 	restarts   []string
 	status     map[string]int
+	inspect    map[string]map[string]any
+	failN      int
+}
+
+func (f *fakeDocker) setStatus(name string, code int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status[name] = code
+}
+
+// setInspect stores what GET /containers/<name>/json returns.
+func (f *fakeDocker) setInspect(name, id, status string, started time.Time, netMode string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inspect[name] = map[string]any{
+		"Id":         id,
+		"Name":       "/" + name,
+		"State":      map[string]any{"Status": status, "StartedAt": started.Format(time.RFC3339Nano)},
+		"HostConfig": map[string]any{"NetworkMode": netMode},
+	}
 }
 
 func (f *fakeDocker) setContainers(c []map[string]any) {
@@ -128,13 +151,25 @@ func startFakeDocker(t *testing.T) (string, *fakeDocker) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeDocker{containers: []map[string]any{}, status: map[string]int{}}
+	f := &fakeDocker{containers: []map[string]any{}, status: map[string]int{}, inspect: map[string]map[string]any{}}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/containers/json":
+			if r.URL.Query().Get("all") != "1" {
+				http.Error(w, "test fake: expected all=1", http.StatusBadRequest)
+				return
+			}
 			json.NewEncoder(w).Encode(f.containers)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/containers/"), "/json")
+			info, ok := f.inspect[name]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			json.NewEncoder(w).Encode(info)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/restart"):
 			name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/containers/"), "/restart")
 			f.restarts = append(f.restarts, name)
@@ -142,7 +177,17 @@ func startFakeDocker(t *testing.T) (string, *fakeDocker) {
 			if code == 0 {
 				code = http.StatusNoContent
 			}
+			if code == http.StatusNoContent {
+				if info, ok := f.inspect[name]; ok {
+					info["State"].(map[string]any)["StartedAt"] = time.Now().Format(time.RFC3339Nano)
+				}
+			}
 			w.WriteHeader(code)
+			if code == http.StatusInternalServerError {
+				// like Docker: a fresh endpoint id in every error message
+				f.failN++
+				fmt.Fprintf(w, `{"message":"failed to set up endpoint (%064x): cannot assign requested address"}`, f.failN)
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -154,7 +199,11 @@ func startFakeDocker(t *testing.T) (string, *fakeDocker) {
 	return sock, f
 }
 
-func lbl(m map[string]string) map[string]any { return map[string]any{"Labels": m} }
+func lbl(m map[string]string) map[string]any { return map[string]any{"Labels": m, "State": "running"} }
+
+func stopped(m map[string]string) map[string]any {
+	return map[string]any{"Labels": m, "State": "exited"}
+}
 
 func readFile(t *testing.T, p string) string {
 	t.Helper()
@@ -274,47 +323,236 @@ func TestEmptyListWritesHeaderOnly(t *testing.T) {
 	checkAll(t, targets)
 }
 
-func TestRestartFallbackAndRetry(t *testing.T) {
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time          { return c.t }
+func (c *clock) advance(d time.Duration) { c.t = c.t.Add(d) }
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return &buf
+}
+
+func TestRestartBackoff(t *testing.T) {
 	sock, dk := startFakeDocker(t)
+	logs := captureLog(t)
 	targets := testTargets(t.TempDir())
 	dk.setContainers([]map[string]any{lbl(map[string]string{"traefik.enable": "true", "traefik.http.routers.a.rule": "Host(`a.jell0.online`)"})})
-	dk.status["ghost"] = http.StatusNotFound
-	dk.status["dnsmasq-ts"] = http.StatusInternalServerError
+	dk.setStatus("ghost", http.StatusNotFound)
+	dk.setStatus("dnsmasq-lan", http.StatusInternalServerError)
 	cfg := config{
 		domain: "jell0.online", dockerSock: sock, targets: targets, interval: time.Second,
 		restart: []string{"dnsmasq-lan", "dnsmasq-ts", "ghost"},
 	}
 	a := newApp(cfg)
+	clk := &clock{t: time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)}
+	a.now = clk.now
 	ctx := context.Background()
-
-	// first pass: three files changed, but every container is restarted once
-	if err := a.tick(ctx); err != nil {
-		t.Fatal(err)
+	tick := func() {
+		t.Helper()
+		if err := a.tick(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
+	attempts := func() int {
+		n := 0
+		for _, r := range dk.restartLog() {
+			if r == "dnsmasq-lan" {
+				n++
+			}
+		}
+		return n
+	}
+
+	// first pass: three files changed, every container is restarted once
+	tick()
 	if got := dk.restartLog(); !reflect.DeepEqual(got, []string{"dnsmasq-lan", "dnsmasq-ts", "ghost"}) {
 		t.Fatalf("restarts: %v", got)
 	}
-	if len(a.pending) != 1 || !a.pending["dnsmasq-ts"] {
+	if len(a.pending) != 1 || a.pending["dnsmasq-lan"] == nil {
 		t.Fatalf("pending: %v", a.pending)
 	}
 
-	// the failed one is retried alone, then the queue is empty
-	dk.status["dnsmasq-ts"] = 0
-	if err := a.tick(ctx); err != nil {
-		t.Fatal(err)
+	// retries back off: due at +5s, then +10s more, then +20s more
+	want := []struct {
+		at       time.Duration
+		attempts int
+	}{
+		{1 * time.Second, 1}, {4 * time.Second, 1}, {5 * time.Second, 2},
+		{10 * time.Second, 2}, {15 * time.Second, 3},
+		{30 * time.Second, 3}, {35 * time.Second, 4},
 	}
-	if got := dk.restartLog()[3:]; !reflect.DeepEqual(got, []string{"dnsmasq-ts"}) {
-		t.Fatalf("retry restarted %v", got)
+	start := clk.t
+	for _, w := range want {
+		clk.t = start.Add(w.at)
+		tick()
+		if got := attempts(); got != w.attempts {
+			t.Fatalf("at +%s: %d attempts, want %d", w.at, got, w.attempts)
+		}
 	}
+
+	// the delay is capped
+	a.pending["dnsmasq-lan"].delay = 4 * time.Minute
+	clk.t = a.pending["dnsmasq-lan"].next
+	tick()
+	if d := a.pending["dnsmasq-lan"].delay; d != maxBackoff {
+		t.Fatalf("delay %s, want cap %s", d, maxBackoff)
+	}
+
+	// four failures with different endpoint ids, one log line
+	if n := strings.Count(logs.String(), "cannot assign requested address"); n != 1 {
+		t.Fatalf("error logged %d times, want 1:\n%s", n, logs.String())
+	}
+
+	// recovery: next due retry succeeds and the queue empties
+	dk.setStatus("dnsmasq-lan", 0)
+	clk.t = a.pending["dnsmasq-lan"].next
+	tick()
 	if len(a.pending) != 0 {
-		t.Fatalf("pending: %v", a.pending)
+		t.Fatalf("pending after recovery: %v", a.pending)
+	}
+	if !strings.Contains(logs.String(), "restarted dnsmasq-lan after earlier failures") {
+		t.Fatalf("missing recovery line:\n%s", logs.String())
 	}
 
-	// nothing changed: nothing restarted
-	if err := a.tick(ctx); err != nil {
+	// idle pass: nothing restarted
+	before := len(dk.restartLog())
+	clk.advance(time.Hour)
+	tick()
+	if n := len(dk.restartLog()); n != before {
+		t.Fatalf("restarts after idle pass: %d, want %d", n, before)
+	}
+}
+
+func TestNetnsPairs(t *testing.T) {
+	sock, dk := startFakeDocker(t)
+	logs := captureLog(t)
+	targets := testTargets(t.TempDir())
+	cfg := config{
+		domain: "jell0.online", dockerSock: sock, targets: targets, interval: time.Second,
+		pairs: []pair{{"tailscale_proxy", "traefik"}},
+	}
+	a := newApp(cfg)
+	ctx := context.Background()
+	tick := func() {
+		t.Helper()
+		if err := a.tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	traefikRestarts := func() int {
+		n := 0
+		for _, r := range dk.restartLog() {
+			if r == "traefik" {
+				n++
+			}
+		}
+		return n
+	}
+	now := time.Now()
+
+	// 1. healthy: traefik started after tailscale, nothing to do
+	dk.setInspect("tailscale_proxy", "P1", "running", now.Add(-17*time.Hour), "default")
+	dk.setInspect("traefik", "T1", "running", now.Add(-17*time.Hour+time.Second), "container:P1")
+	tick()
+	if n := traefikRestarts(); n != 0 {
+		t.Fatalf("healthy pair restarted traefik %d times", n)
+	}
+
+	// 2. tailscale restarted (same id, newer start): traefik restarted once,
+	// and not again once it is newer
+	dk.setInspect("tailscale_proxy", "P1", "running", now.Add(-4*time.Hour), "default")
+	tick()
+	tick()
+	tick()
+	if n := traefikRestarts(); n != 1 {
+		t.Fatalf("traefik restarts after tailscale restart: %d, want 1", n)
+	}
+
+	// 3. tailscale crash looping: left alone
+	dk.setInspect("tailscale_proxy", "P1", "restarting", time.Now().Add(time.Second), "default")
+	tick()
+	if n := traefikRestarts(); n != 1 {
+		t.Fatalf("restarted traefik while tailscale was restarting")
+	}
+
+	// 4. tailscale recreated (new id): no restart, one warning
+	dk.setInspect("tailscale_proxy", "P2", "running", time.Now().Add(time.Second), "default")
+	tick()
+	tick()
+	if n := traefikRestarts(); n != 1 {
+		t.Fatalf("restarted traefik although it points at a removed container")
+	}
+	if n := strings.Count(logs.String(), "attached to an old tailscale_proxy container"); n != 1 {
+		t.Fatalf("recreate warning logged %d times, want 1", n)
+	}
+
+	// 5. network mode by name instead of id is accepted
+	dk.setInspect("traefik", "T1", "running", now.Add(-time.Hour), "container:tailscale_proxy")
+	dk.setInspect("tailscale_proxy", "P3", "running", now, "default")
+	tick()
+	if n := traefikRestarts(); n != 2 {
+		t.Fatalf("name based network mode: %d traefik restarts, want 2", n)
+	}
+
+	// 6. one side missing: nothing, no error
+	b := newApp(config{domain: "jell0.online", dockerSock: sock, targets: targets, interval: time.Second,
+		pairs: []pair{{"ghost", "traefik"}, {"tailscale_proxy", "ghost"}}})
+	if err := b.tick(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(dk.restartLog()); n != 4 {
-		t.Fatalf("restarts after idle pass: %d", n)
+	if n := traefikRestarts(); n != 2 {
+		t.Fatalf("missing container caused a restart")
 	}
+}
+
+func TestLoadConfigPairs(t *testing.T) {
+	t.Setenv("TARGETS", "/out/h=10.0.0.1")
+	t.Setenv("NETNS_PAIRS", " tailscale_proxy:traefik , a:b")
+	c, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.pairs, []pair{{"tailscale_proxy", "traefik"}, {"a", "b"}}) {
+		t.Fatalf("pairs: %+v", c.pairs)
+	}
+	for _, bad := range []string{"novalue", ":b", "a:", "a:a"} {
+		t.Setenv("NETNS_PAIRS", bad)
+		if _, err := loadConfig(); err == nil {
+			t.Fatalf("NETNS_PAIRS=%q should be rejected", bad)
+		}
+	}
+}
+
+func TestStoppedContainers(t *testing.T) {
+	sock, dk := startFakeDocker(t)
+	targets := testTargets(t.TempDir())
+	dk.setContainers([]map[string]any{
+		lbl(map[string]string{"traefik.enable": "true", "traefik.http.routers.up.rule": "Host(`up.jell0.online`)"}),
+		// Sablier style: stopped, but Traefik keeps the router
+		stopped(map[string]string{
+			"traefik.enable":                       "true",
+			"traefik.http.routers.bin.rule":        "Host(`bin.jell0.online`)",
+			"traefik.http.routers.bin.tls":         "true",
+			"traefik.docker.allownonrunning":       "true",
+			"traefik.http.routers.bin.middlewares": "bin-sablier",
+		}),
+		// stopped without the label: Traefik drops it, so must we
+		stopped(map[string]string{"traefik.enable": "true", "traefik.http.routers.old.rule": "Host(`old.jell0.online`)"}),
+		// created but never started, with the label
+		map[string]any{"State": "created", "Labels": map[string]string{
+			"traefik.enable": "true", "traefik.docker.allownonrunning": "True",
+			"traefik.http.routers.c.rule": "Host(`created.jell0.online`)",
+		}},
+		// label present but traefik.enable=false still wins
+		stopped(map[string]string{"traefik.enable": "false", "traefik.docker.allownonrunning": "true",
+			"traefik.http.routers.off.rule": "Host(`off.jell0.online`)"}),
+	})
+	a := newApp(config{domain: "jell0.online", dockerSock: sock, targets: targets, interval: time.Second})
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	checkAll(t, targets, "bin.jell0.online", "created.jell0.online", "up.jell0.online")
 }

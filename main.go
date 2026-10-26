@@ -21,7 +21,8 @@
 //
 // If Docker cannot be read, the existing files are left untouched. When a
 // file changes, the RESTART containers are restarted, since dnsmasq only
-// reads its config at startup.
+// reads its config at startup. A failing restart is retried with backoff
+// (5s doubling up to 5m) and its error is logged once, not on every retry.
 //
 // Environment:
 //
@@ -34,6 +35,11 @@
 //	              to the upstream even if a Traefik label exists
 //	RESTART       comma separated dnsmasq container names to restart when a
 //	              file changes. Needed, dnsmasq does not reload conf files.
+//	NETNS_PAIRS   comma separated parent:child pairs, where child runs with
+//	              network_mode service:parent, for example
+//	              tailscale_proxy:traefik. When parent starts after child,
+//	              child is stuck in the old, dead network namespace, so it is
+//	              restarted to rejoin.
 //	EXPOSED_BY_DEFAULT  set to true to match Traefik exposedByDefault=true
 //	              (default false: only traefik.enable=true containers count)
 //	INTERVAL      Docker check interval (default 5s)
@@ -74,12 +80,24 @@ var (
 
 type target struct{ path, ip string }
 
+type pair struct{ parent, child string }
+
+const (
+	minBackoff = 5 * time.Second
+	maxBackoff = 5 * time.Minute
+)
+
+// dockerID matches container and endpoint ids, which differ on every failed
+// attempt and would otherwise make each retry error look new.
+var dockerID = regexp.MustCompile(`[0-9a-f]{64}`)
+
 type config struct {
 	domain     string
 	dockerSock string
 	targets    []target
 	exclude    map[string]bool
 	restart    []string
+	pairs      []pair
 	exposedAll bool
 	interval   time.Duration
 	once       bool
@@ -148,6 +166,14 @@ func loadConfig() (config, error) {
 		c.exclude[h] = true
 	}
 	c.restart = list(os.Getenv("RESTART"))
+	for _, item := range list(os.Getenv("NETNS_PAIRS")) {
+		parent, child, ok := strings.Cut(item, ":")
+		parent, child = strings.TrimSpace(parent), strings.TrimSpace(child)
+		if !ok || parent == "" || child == "" || parent == child {
+			return c, fmt.Errorf("NETNS_PAIRS: want parent:child, got %q", item)
+		}
+		c.pairs = append(c.pairs, pair{parent, child})
+	}
 	c.exposedAll = strings.EqualFold(env("EXPOSED_BY_DEFAULT", "false"), "true")
 	if c.interval, err = time.ParseDuration(env("INTERVAL", "5s")); err != nil || c.interval < time.Second {
 		return c, errors.New("INTERVAL: want a duration of at least 1s")
@@ -171,11 +197,14 @@ func newDocker(sock string) *docker {
 	return &docker{hc: &http.Client{Transport: tr}}
 }
 
-// labels returns the label set of every running container.
+// labels returns the label set of every container Traefik would route:
+// running ones, plus stopped ones labelled traefik.docker.allownonrunning=true
+// (used by Sablier and similar scale-to-zero setups, where Traefik keeps the
+// router while the container sleeps).
 func (d *docker) labels(ctx context.Context) ([]map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/json", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/json?all=1", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -187,15 +216,59 @@ func (d *docker) labels(ctx context.Context) ([]map[string]string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("docker: GET /containers/json: %s", resp.Status)
 	}
-	var cs []struct{ Labels map[string]string }
+	var cs []struct {
+		Labels map[string]string
+		State  string
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&cs); err != nil {
 		return nil, fmt.Errorf("docker: decode container list: %w", err)
 	}
 	out := make([]map[string]string, 0, len(cs))
 	for _, c := range cs {
-		out = append(out, c.Labels)
+		if c.State == "running" || strings.EqualFold(strings.TrimSpace(c.Labels["traefik.docker.allownonrunning"]), "true") {
+			out = append(out, c.Labels)
+		}
 	}
 	return out, nil
+}
+
+type containerInfo struct {
+	ID    string `json:"Id"`
+	Name  string `json:"Name"`
+	State struct {
+		Status    string    `json:"Status"`
+		StartedAt time.Time `json:"StartedAt"`
+	} `json:"State"`
+	HostConfig struct {
+		NetworkMode string `json:"NetworkMode"`
+	} `json:"HostConfig"`
+}
+
+// inspect returns a container's details, or nil when it does not exist.
+func (d *docker) inspect(ctx context.Context, name string) (*containerInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	u := "http://docker/containers/" + url.PathEscape(name) + "/json"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("docker: inspect %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("docker: inspect %s: %s", name, resp.Status)
+	}
+	var ci containerInfo
+	if err := json.NewDecoder(resp.Body).Decode(&ci); err != nil {
+		return nil, fmt.Errorf("docker: decode inspect %s: %w", name, err)
+	}
+	return &ci, nil
 }
 
 // restart restarts a container by name. found is false when it does not exist.
@@ -292,17 +365,38 @@ func writeIfChanged(path, content string) (bool, error) {
 
 // ---------------------------------------------------------------- app
 
+type retry struct {
+	next    time.Time
+	delay   time.Duration
+	lastErr string
+}
+
 type app struct {
 	cfg     config
 	dk      *docker
-	pending map[string]bool
+	now     func() time.Time
+	pending map[string]*retry
+	warned  map[string]string
 }
 
 func newApp(cfg config) *app {
-	return &app{cfg: cfg, dk: newDocker(cfg.dockerSock), pending: map[string]bool{}}
+	return &app{
+		cfg:     cfg,
+		dk:      newDocker(cfg.dockerSock),
+		now:     time.Now,
+		pending: map[string]*retry{},
+		warned:  map[string]string{},
+	}
+}
+
+func (a *app) queue(name string, now time.Time) {
+	if _, ok := a.pending[name]; !ok {
+		a.pending[name] = &retry{next: now}
+	}
 }
 
 func (a *app) tick(ctx context.Context) error {
+	now := a.now()
 	sets, err := a.dk.labels(ctx)
 	if err != nil {
 		return err
@@ -316,27 +410,83 @@ func (a *app) tick(ctx context.Context) error {
 		if changed {
 			log.Printf("wrote %s (%s): %d hosts: %s", t.path, t.ip, len(hosts), strings.Join(hosts, ", "))
 			for _, n := range a.cfg.restart {
-				a.pending[n] = true
+				a.queue(n, now)
 			}
 		}
 	}
-	for _, n := range a.cfg.restart {
-		if !a.pending[n] {
+	a.checkPairs(ctx, now)
+	a.runRestarts(ctx, now)
+	return nil
+}
+
+// checkPairs queues a restart of each child whose parent started after it.
+func (a *app) checkPairs(ctx context.Context, now time.Time) {
+	for _, p := range a.cfg.pairs {
+		pi, err := a.dk.inspect(ctx, p.parent)
+		if err != nil || pi == nil {
+			continue
+		}
+		ci, err := a.dk.inspect(ctx, p.child)
+		if err != nil || ci == nil {
+			continue
+		}
+		// A stopped child may be on purpose, and a crash looping parent is
+		// left to its own restart policy until it stays up.
+		if pi.State.Status != "running" || ci.State.Status != "running" {
+			continue
+		}
+		if ref, ok := strings.CutPrefix(ci.HostConfig.NetworkMode, "container:"); ok &&
+			ref != pi.ID && ref != p.parent && ref != strings.TrimPrefix(pi.Name, "/") {
+			// Parent was recreated: child points at an id that is gone, and
+			// only recreating child fixes that.
+			if a.warned[p.child] != pi.ID {
+				a.warned[p.child] = pi.ID
+				log.Printf("%s is attached to an old %s container, a restart cannot fix it: run docker compose up -d %s",
+					p.child, p.parent, p.child)
+			}
+			continue
+		}
+		if pi.State.StartedAt.After(ci.State.StartedAt) {
+			if _, queued := a.pending[p.child]; !queued {
+				log.Printf("%s started after %s, so %s lost its network, restarting it", p.parent, p.child, p.child)
+				a.queue(p.child, now)
+			}
+		}
+	}
+}
+
+// runRestarts attempts every due restart, backing off on failure.
+func (a *app) runRestarts(ctx context.Context, now time.Time) {
+	names := make([]string, 0, len(a.pending))
+	for n := range a.pending {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		r := a.pending[n]
+		if now.Before(r.next) {
 			continue
 		}
 		found, err := a.dk.restart(ctx, n)
 		if err != nil {
-			log.Printf("%v (will retry)", err)
+			r.delay = min(max(r.delay*2, minBackoff), maxBackoff)
+			r.next = now.Add(r.delay)
+			if msg := dockerID.ReplaceAllString(err.Error(), "<id>"); msg != r.lastErr {
+				log.Printf("%s (retrying with backoff up to %s, logged once)", msg, maxBackoff)
+				r.lastErr = msg
+			}
 			continue
 		}
 		delete(a.pending, n)
-		if found {
-			log.Printf("restarted %s", n)
-		} else {
+		switch {
+		case !found:
 			log.Printf("container %s not found, skipped (it reads the config when it starts)", n)
+		case r.lastErr != "":
+			log.Printf("restarted %s after earlier failures", n)
+		default:
+			log.Printf("restarted %s", n)
 		}
 	}
-	return nil
 }
 
 func (a *app) run(ctx context.Context) error {
@@ -374,8 +524,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("domain=%s interval=%s targets=%d restart=%v exposedByDefault=%t",
-		cfg.domain, cfg.interval, len(cfg.targets), cfg.restart, cfg.exposedAll)
+	log.Printf("domain=%s interval=%s targets=%d restart=%v netnsPairs=%v exposedByDefault=%t",
+		cfg.domain, cfg.interval, len(cfg.targets), cfg.restart, cfg.pairs, cfg.exposedAll)
 	if len(cfg.restart) == 0 {
 		log.Print("warning: RESTART is empty, dnsmasq will not see changes until it restarts")
 	}
