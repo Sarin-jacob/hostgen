@@ -1,0 +1,66 @@
+# Backup nameserver for jell0.online, run on a machine other than jell0.
+#
+# The tailscale container is its own node in the jell0 owner's tailnet,
+# separate from the machine's own Tailscale (which can be in another tailnet).
+# dnsmasq and hostgen share its network namespace: dnsmasq answers on the
+# node's 100.x IP, port 53, and hostgen reaches jell0's hostgen over the
+# tailnet to copy the name list. Nothing else listens on the node.
+#
+# Setup: copy this whole repo to the machine, put TS_AUTHKEY in backup/.env,
+# then from backup/: docker compose up -d --build
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: jell0dns-tailscale
+    hostname: jell0-dns-backup
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env}
+      TS_AUTH_ONCE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      TS_ACCEPT_DNS: "false"
+      TS_EXTRA_ARGS: --advertise-tags=tag:container
+    volumes:
+      - ./ts-state:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    dns: [1.1.1.1, 1.0.0.1]
+    restart: unless-stopped
+    logging: &logging
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+  dnsmasq:
+    build: ./dnsmasq
+    image: jell0dns-dnsmasq:local
+    container_name: jell0dns-dnsmasq
+    network_mode: service:tailscale
+    volumes:
+      - ./dnsmasq.config:/etc/dnsmasq.conf:ro
+      - ./hosts:/etc/dnsmasq.hosts.d:ro
+    restart: unless-stopped
+    logging: *logging
+
+  hostgen:
+    build: ..
+    image: hostgen:local
+    container_name: jell0dns-hostgen
+    network_mode: service:tailscale
+    read_only: true
+    environment:
+      DOMAIN: jell0.online
+      SOURCE: http://100.111.232.103:8053/hosts
+      # Same IP as jell0's ts target: names point at jell0's Traefik, no
+      # matter which nameserver answered.
+      TARGETS: /out/traefik.conf=100.101.188.115
+      RESTART: jell0dns-dnsmasq
+      # Both live in the tailscale container's namespace. hostgen restarting
+      # itself is fine: Docker brings it back in the new namespace.
+      NETNS_PAIRS: jell0dns-tailscale:jell0dns-dnsmasq,jell0dns-tailscale:jell0dns-hostgen
+      INTERVAL: 30s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./hosts:/out
+    restart: unless-stopped
+    logging: *logging

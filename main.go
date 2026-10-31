@@ -45,6 +45,15 @@
 //	INTERVAL      Docker check interval (default 5s)
 //	DOCKER_SOCK   socket path (default /var/run/docker.sock)
 //	ONCE          set to 1 for a single pass, exit 1 on failure
+//	SERVE         listen address, for example :8053. Serves the last
+//	              successfully read name list at GET /hosts, one name per
+//	              line, so a backup hostgen on another machine can follow it.
+//	              503 until the first successful read.
+//	SOURCE        http(s) URL of another hostgen's /hosts. When set, names
+//	              come from there instead of Docker labels (Docker is still
+//	              used for RESTART and NETNS_PAIRS). If the source is down or
+//	              sends anything invalid, the files are left untouched, so a
+//	              backup keeps serving the last list while the primary is gone.
 package main
 
 import (
@@ -63,6 +72,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -101,6 +111,8 @@ type config struct {
 	exposedAll bool
 	interval   time.Duration
 	once       bool
+	serve      string
+	source     string
 }
 
 func env(key, def string) string {
@@ -179,6 +191,14 @@ func loadConfig() (config, error) {
 		return c, errors.New("INTERVAL: want a duration of at least 1s")
 	}
 	c.once = os.Getenv("ONCE") == "1"
+	c.serve = env("SERVE", "")
+	c.source = env("SOURCE", "")
+	if c.source != "" {
+		u, err := url.Parse(c.source)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return c, fmt.Errorf("SOURCE: want an http(s) URL, got %q", c.source)
+		}
+	}
 	return c, nil
 }
 
@@ -322,6 +342,45 @@ func traefikHosts(sets []map[string]string, exposedByDefault bool) map[string]bo
 	return out
 }
 
+// ---------------------------------------------------------------- source
+
+// fetchHosts reads a name list served by another hostgen. Any invalid line
+// rejects the whole list, so a broken or hostile source cannot inject config
+// and a partial list never replaces a good one.
+func fetchHosts(ctx context.Context, hc *http.Client, src string) (map[string]bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("source: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("source: GET %s: %s", src, resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("source: read: %w", err)
+	}
+	out := map[string]bool{}
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		h, ok := normalize(line)
+		if !ok {
+			return nil, fmt.Errorf("source: invalid hostname %q, list ignored", line)
+		}
+		out[h] = true
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------- output
 
 // selectHosts keeps names under domain that are not excluded, sorted.
@@ -374,19 +433,64 @@ type retry struct {
 type app struct {
 	cfg     config
 	dk      *docker
+	hc      *http.Client
 	now     func() time.Time
 	pending map[string]*retry
 	warned  map[string]string
+
+	mu     sync.Mutex
+	served []string // last successfully read list, nil until the first one
 }
 
 func newApp(cfg config) *app {
 	return &app{
 		cfg:     cfg,
 		dk:      newDocker(cfg.dockerSock),
+		hc:      &http.Client{},
 		now:     time.Now,
 		pending: map[string]*retry{},
 		warned:  map[string]string{},
 	}
+}
+
+// hosts returns the names to publish, from SOURCE when set, else from Docker.
+func (a *app) hosts(ctx context.Context) ([]string, error) {
+	var raw map[string]bool
+	if a.cfg.source != "" {
+		var err error
+		if raw, err = fetchHosts(ctx, a.hc, a.cfg.source); err != nil {
+			return nil, err
+		}
+	} else {
+		sets, err := a.dk.labels(ctx)
+		if err != nil {
+			return nil, err
+		}
+		raw = traefikHosts(sets, a.cfg.exposedAll)
+	}
+	return selectHosts(raw, a.cfg.domain, a.cfg.exclude), nil
+}
+
+// ServeHTTP serves the last successfully read name list at GET /hosts.
+func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/hosts" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.mu.Lock()
+	hosts := a.served
+	a.mu.Unlock()
+	if hosts == nil {
+		http.Error(w, "no successful read yet", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	io.WriteString(w, strings.Join(append([]string{strings.TrimSpace(header)}, hosts...), "\n")+"\n")
 }
 
 func (a *app) queue(name string, now time.Time) {
@@ -397,11 +501,17 @@ func (a *app) queue(name string, now time.Time) {
 
 func (a *app) tick(ctx context.Context) error {
 	now := a.now()
-	sets, err := a.dk.labels(ctx)
+	hosts, err := a.hosts(ctx)
 	if err != nil {
+		// Restarts and namespace checks still run: a backup must keep its
+		// dnsmasq healthy while the primary it follows is down.
+		a.checkPairs(ctx, now)
+		a.runRestarts(ctx, now)
 		return err
 	}
-	hosts := selectHosts(traefikHosts(sets, a.cfg.exposedAll), a.cfg.domain, a.cfg.exclude)
+	a.mu.Lock()
+	a.served = append([]string{}, hosts...)
+	a.mu.Unlock()
 	for _, t := range a.cfg.targets {
 		changed, err := writeIfChanged(t.path, render(t.ip, hosts))
 		if err != nil {
@@ -524,14 +634,24 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("domain=%s interval=%s targets=%d restart=%v netnsPairs=%v exposedByDefault=%t",
-		cfg.domain, cfg.interval, len(cfg.targets), cfg.restart, cfg.pairs, cfg.exposedAll)
+	log.Printf("domain=%s interval=%s targets=%d restart=%v netnsPairs=%v exposedByDefault=%t source=%q serve=%q",
+		cfg.domain, cfg.interval, len(cfg.targets), cfg.restart, cfg.pairs, cfg.exposedAll, cfg.source, cfg.serve)
 	if len(cfg.restart) == 0 {
 		log.Print("warning: RESTART is empty, dnsmasq will not see changes until it restarts")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := newApp(cfg).run(ctx); err != nil {
+	a := newApp(cfg)
+	if cfg.serve != "" {
+		srv := &http.Server{Addr: cfg.serve, Handler: a, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("serve: %v", err)
+			}
+		}()
+		defer srv.Close()
+	}
+	if err := a.run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
