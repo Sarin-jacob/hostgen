@@ -3,17 +3,22 @@
 // It lists running containers over the Docker socket, extracts hostnames from
 // traefik.http.routers.<name>.rule labels (Host(...) matchers only), keeps the
 // ones under DOMAIN, and writes one dnsmasq conf file per target, each with
-// that target's own IP. Every name gets two lines:
+// that target's own IP. Every name gets three lines:
 //
 //	host-record=lfs.jell0.online,100.101.188.115
 //	local=/lfs.jell0.online/
+//	server=/*.lfs.jell0.online/#
 //
 // host-record answers A (and the matching PTR) locally. local= stops dnsmasq
 // from forwarding any other query for that name, so HTTPS (type 65) records
 // published by Cloudflare, with their ECH keys, never reach local clients.
 // Without that, Firefox based browsers send an ECH ClientHello to Traefik and
-// fail with a certificate error. Names Traefik does not serve are untouched
-// and resolve through the upstream as usual, ECH included.
+// fail with a certificate error. local= also covers every subdomain, so the
+// server= line sends subdomains back to the upstream. That matters most for
+// the apex: a Host(`jell0.online`) router would otherwise turn every tunnel
+// name into NXDOMAIN. The *. wildcard needs dnsmasq 2.86 or newer. Names
+// Traefik does not serve are untouched and resolve through the upstream as
+// usual, ECH included.
 //
 // dnsmasq must have no wildcard address= rule for the domain and must read
 // the files with conf-dir=<dir>,*.conf. HostRegexp routers, such as a
@@ -400,7 +405,7 @@ func render(ip string, hosts []string) string {
 	var b strings.Builder
 	b.WriteString(header)
 	for _, h := range hosts {
-		fmt.Fprintf(&b, "host-record=%s,%s\nlocal=/%s/\n", h, ip, h)
+		fmt.Fprintf(&b, "host-record=%s,%s\nlocal=/%s/\nserver=/*.%s/#\n", h, ip, h, h)
 	}
 	return b.String()
 }

@@ -58,15 +58,9 @@ Now:
 
 Why `local=` per name (ECH fix): Cloudflare publishes HTTPS (type 65) records with an ECH key for proxied names. dnsmasq only answers A/AAAA locally and forwards other types, so a client got the local A record plus Cloudflare's ECH key. Firefox based browsers (Zen) then sent an ECH ClientHello to Traefik with outer SNI `cloudflare-ech.com`, Traefik answered with a non matching cert, and Zen showed a certificate warning (seen on `lfs.jell0.online`, which exists on both Traefik and Cloudflare). `local=/name/` stops forwarding for local names, so HTTPS queries for them get no data and the browser does a normal handshake. Tunnel only names keep their full Cloudflare answers, ECH included. Rejected alternatives: global `filter-rr=HTTPS` (needs dnsmasq 2.90+, affects all names), turning off ECH in Cloudflare (zone wide).
 
-UNVERIFIED: that dnsmasq returns NOERROR/NODATA (not NXDOMAIN) for an HTTPS query on a name that has a `host-record` and is under `local=`. Expected, never confirmed because Traefik was stranded when the test ran. Check:
-```
-dig @100.101.188.115 lfs.jell0.online HTTPS      # want status NOERROR, empty answer
-dig @100.101.188.115 lfs.jell0.online A +short   # want 100.101.188.115
-dig @100.101.188.115 kailo.jell0.online HTTPS +short   # tunnel only name, Cloudflare record
-```
-If HTTPS returns NXDOMAIN, browsers treat the name as nonexistent and the approach must change.
+Verified on dnsmasq 2.90 (2026-10-31, on dh): a name with `host-record` + `local=` returns NOERROR with an empty answer for HTTPS, its A record locally, and a tunnel only name (`kailo`) keeps Cloudflare's HTTPS record with ECH.
 
-Side effect: subdomains of a local name (`x.lfs.jell0.online`) return NXDOMAIN instead of going to Cloudflare.
+`local=/name/` also covers every subdomain. Bug found 2026-10-31: a router with `Host(\`jell0.online\`)` put the apex in the list, so `local=/jell0.online/` made every tunnel and other machine name NXDOMAIN on dnsmasq-ts (confirmed: `kailo` NXDOMAIN via 100.101.188.115, resolves via 1.1.1.1). Fix: hostgen now also writes `server=/*.name/#` per name, which sends subdomains back to the upstream servers (`#`) while the name itself stays local. The `*.` wildcard needs dnsmasq 2.86 or newer; the `jpillora/dnsmasq` version on jell0 is unknown (open item 7). Older dnsmasq may reject the line or ignore it, so check before deploying, or switch jell0's three dnsmasq containers to the alpine image in `backup/dnsmasq` (2.90, also drops the webproc editor).
 
 Names on both Traefik and Cloudflare are intentional (tailnet when available, internet otherwise). Locally they bypass Cloudflare Access/WAF; Traefik SSO covers that. `EXCLUDE` on hostgen forces a name to always go to Cloudflare.
 
@@ -241,7 +235,7 @@ Known risk: Tailscale issue #12677 reports iOS/macOS not failing over cleanly wh
 
 ## Open items
 
-1. Verify the `local=` NODATA behaviour with the `dig` commands above, then confirm Zen opens `lfs.jell0.online` on the tailnet (clear `about:networking#dns` first).
+1. NODATA behaviour verified on dnsmasq 2.90 (see above). Still to do: confirm Zen opens `lfs.jell0.online` on the tailnet (clear `about:networking#dns` first), on jell0's dnsmasq version.
 2. Sablier as a local plugin: move from `experimental.plugins` to `experimental.localPlugins` keeping the same `moduleName`, clone the plugin repo at the current version into `./plugins-local/src/<moduleName>`, mount `./plugins-local:/plugins-local:ro` into Traefik. Middleware labels stay the same. Need the current `experimental` section of `traefik.yml`.
 3. Log rotation on all these services (`log-queries` is chatty, default json-file never rotates):
    ```yaml
@@ -254,7 +248,7 @@ Known risk: Tailscale issue #12677 reports iOS/macOS not failing over cleanly wh
 6. Optional: merge `dnsmasq-lan` and `dnsmasq-zerotier` into one host networked dnsmasq with `bind-dynamic` and `localise-queries`. `dnsmasq-ts` must stay for the shared node.
 7. Optional: check the jpillora/dnsmasq version (`docker exec dnsmasq-ts dnsmasq -v | head -1`); it may be old. Configs only use long standing options.
 8. Optional: `traefik.tcp.routers.*` with `HostSNI` are not read by hostgen (none in use).
-9. Backup nameserver: deploy (steps in "Backup nameserver"), then test with jell0 off: `dig @<backup 100.x> kailo.jell0.online +short` and a browser on a tailnet device, including an iOS/macOS one. Not yet tested against real Docker, Tailscale or dnsmasq.
+9. Backup nameserver: deployed on dh 2026-10-31, node `jell0-dns-backup` 100.64.136.114. First fetch from jell0 worked (37 names), later TCP from the node to 100.111.232.103 times out on every port while `tailscale ping` works: tailnet policy must allow `tag:container` to `100.111.232.103:8053`. Then test with jell0 off: `dig @<backup 100.x> kailo.jell0.online +short` and a browser on a tailnet device, including an iOS/macOS one. Not yet tested against real Docker, Tailscale or dnsmasq.
 
 ## Useful commands
 

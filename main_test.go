@@ -59,8 +59,8 @@ func TestSelectHosts(t *testing.T) {
 func TestRender(t *testing.T) {
 	got := render("10.0.0.1", []string{"a.x", "b.x"})
 	want := header +
-		"host-record=a.x,10.0.0.1\nlocal=/a.x/\n" +
-		"host-record=b.x,10.0.0.1\nlocal=/b.x/\n"
+		"host-record=a.x,10.0.0.1\nlocal=/a.x/\nserver=/*.a.x/#\n" +
+		"host-record=b.x,10.0.0.1\nlocal=/b.x/\nserver=/*.b.x/#\n"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
